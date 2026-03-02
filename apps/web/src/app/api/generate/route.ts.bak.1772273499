@@ -1,0 +1,507 @@
+import { NextResponse } from "next/server";
+import { z } from "zod";
+import type { FormState, GenerateResponse, GeneratedPost, Platform } from "@/lib/spg-types";
+import path from "path";
+import { promises as fs } from "fs";
+
+export const runtime = "nodejs";
+
+/** ========== Config ========== */
+const MAX_UPLOAD_IMAGES = 3;
+const MAX_ARK_IMAGES = 4; // 每次任务最多生成多少张“真正二创图”，其余先用抠图占位，避免烧钱/超时
+
+/** ========== Schema ========== */
+const PlatformEnum = z.enum(["instagram", "facebook", "x", "pinterest"]);
+const PostSchema = z.object({
+  platform: PlatformEnum,
+  scheduledDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  title: z.string().optional(),
+  bodyText: z.string().min(1),
+  hashtags: z.array(z.string()).default([]),
+  imagePrompt: z.string().optional(),
+});
+const OutputSchema = z.object({ posts: z.array(PostSchema).min(1) });
+
+/** ========== Helpers ========== */
+function toISODate(d: Date) {
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+function addMonths(from: Date, months: number) {
+  const d = new Date(from);
+  d.setMonth(d.getMonth() + months);
+  return d;
+}
+function addDays(d: Date, days: number) {
+  const x = new Date(d);
+  x.setDate(x.getDate() + days);
+  return x;
+}
+function clampStr(s: string, max = 2200) {
+  return s.length > max ? s.slice(0, max) + "…" : s;
+}
+function marketToCountryCode(market: string) {
+  const m = (market || "").toUpperCase();
+  const map: Record<string, string> = { US: "US", UK: "GB", FR: "FR", DE: "DE", ES: "ES", JP: "JP" };
+  return map[m] || "US";
+}
+function ensureAbsoluteUrl(u: string) {
+  if (!u) return u;
+  if (u.startsWith("http://") || u.startsWith("https://")) return u;
+  const base = process.env.PUBLIC_BASE_URL || "http://localhost:3000";
+  return `${base}${u}`;
+}
+
+type Holiday = { date: string; localName?: string; name?: string };
+const holidayCache = new Map<string, { ts: number; data: Holiday[] }>();
+
+async function getHolidaysNager(countryCode: string, startISO: string, endISO: string) {
+  const cacheKey = `${countryCode}:${startISO}:${endISO}`;
+  const cached = holidayCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < 6 * 60 * 60 * 1000) return cached.data;
+
+  const startYear = Number(startISO.slice(0, 4));
+  const endYear = Number(endISO.slice(0, 4));
+  const years = startYear === endYear ? [startYear] : [startYear, endYear];
+
+  const all: Holiday[] = [];
+  for (const y of years) {
+    const url = `https://date.nager.at/api/v3/PublicHolidays/${y}/${countryCode}`;
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      holidayCache.set(cacheKey, { ts: Date.now(), data: [] });
+      return [];
+    }
+    const arr = (await resp.json()) as any[];
+    for (const h of arr || []) {
+      if (h?.date) all.push({ date: String(h.date), localName: h.localName, name: h.name });
+    }
+  }
+
+  const data = all.filter((h) => h.date >= startISO && h.date <= endISO).sort((a, b) => a.date.localeCompare(b.date));
+  holidayCache.set(cacheKey, { ts: Date.now(), data });
+  return data;
+}
+
+function pickHashtags(industry: string) {
+  const base = ["wellness", "selfcare", "dailyhabits", "shoponline"];
+  const map: Record<string, string[]> = {
+    "保健品": ["supplements", "coq10", "hearthealth", "energyboost"],
+    "护肤": ["skincare", "glowingskin", "beautyroutine", "cleanbeauty"],
+    "美容": ["beauty", "beautytips", "musthave", "routine"],
+    "时尚": ["style", "outfit", "streetstyle", "wardrobe"],
+    "电子产品": ["tech", "gadgets", "smartlife", "innovation"],
+    "家居": ["homedecor", "cozyhome", "interior", "homeideas"],
+    "宠物": ["petlove", "petcare", "catlife", "doglife"],
+    "运动健身": ["fitness", "workout", "training", "fitlife"],
+  };
+  return [...base, ...(map[industry] || [])].slice(0, 10);
+}
+
+function buildImagePrompt(state: FormState, platform: Platform) {
+  if (!state.useImage) return undefined;
+  const ratio =
+    platform === "instagram" ? "1:1" :
+    platform === "pinterest" ? "2:3" :
+    platform === "facebook" ? "4:5" :
+    "16:9";
+
+  return `Create a marketing image for "${state.productName}".
+Style: ${state.imageStyle}. Tone: ${state.tone}. Audience: ${state.audience}. Industry: ${state.industry}.
+Composition: premium DTC ad, clean layout, strong focal product, readable negative space, no excessive text.
+Aspect ratio: ${ratio}.`;
+}
+
+// 让 imageStyle 更落地：追加一些“风格补充词”
+function styleSuffix(imageStyle: string) {
+  const map: Record<string, string> = {
+    "自然真实(生活方式)": "Lifestyle, candid real-life scene, natural daylight, human touch, authentic, not overly staged.",
+    "高端质感": "Premium, refined materials, editorial lighting, subtle shadows, luxury product photography.",
+    "(暗调奢华)": "Low-key luxury, dark moody background, rim light, glossy highlights, cinematic contrast.",
+    "明亮电商(干净棚拍)": "High-key studio lighting, clean backdrop, crisp details, e-commerce style, minimal clutter.",
+    "科技感(冷色未来)": "Cool tones, futuristic, neon accents, metallic textures, clean tech aesthetic.",
+    "清新自然(植物光感)": "Fresh, airy, botanical elements, soft green highlights, gentle sunlight, clean wellness vibe.",
+    "运动能量(动感硬朗)": "Dynamic composition, bold angles, energetic mood, sporty textures, punchy contrast.",
+    "可爱卡通(软萌插画)": "Cute, soft illustration style, rounded shapes, playful, friendly color mood.",
+    "极简留白(高级排版)": "Minimal layout, lots of negative space, modern typography-safe composition, premium design grid.",
+  };
+  return map[imageStyle] || "Premium DTC aesthetic, clean composition, modern lighting.";
+}
+
+/** ========== DeepSeek ========== */
+function buildSystemPrompt() {
+  return `
+You are a senior social media copywriter for cross-border DTC brands (Shopify sellers).
+Return ONLY valid JSON. No markdown. No extra text.
+Schema: { "posts": [ { "platform": "...", "scheduledDate": "YYYY-MM-DD", "title"?, "bodyText": "...", "hashtags": ["..."], "imagePrompt"? } ] }
+Rules:
+- scheduledDate must be within date range.
+- Platform styles:
+  - instagram: longer caption ok, line breaks, friendly CTA, emojis allowed.
+  - facebook: informative, trust-building, clear CTA.
+  - x: concise, punchy, ideally <= 240 chars.
+  - pinterest: benefit-led, save-worthy, include helpful title sometimes.
+- If needHashtags=false => [].
+- If useImage=false => omit imagePrompt.
+- If useImage=true => provide imagePrompt per post (short but specific).
+Holiday usage: natural, not forced.
+Safety: avoid medical claims/guarantees for supplements/skincare. Use compliant language like "supports", "may", "daily routine".
+`;
+}
+function buildUserPrompt(state: FormState, startISO: string, endISO: string, holidays: Holiday[]) {
+  const holidayText =
+    holidays.length === 0
+      ? "No holiday data available."
+      : holidays.slice(0, 25).map((h) => `- ${h.date}: ${h.name || h.localName || "Holiday"}`).join("\n");
+
+  return `
+Generate a social posting plan.
+Inputs:
+- platforms: ${JSON.stringify(state.platforms)}
+- market: ${state.market} (countryCode=${marketToCountryCode(state.market)})
+- language: ${state.language}
+- tone: ${state.tone}
+- audience: ${state.audience}
+- industry: ${state.industry}
+- productName: ${state.productName}
+- keySellingPoints: ${clampStr(state.keySellingPoints, 1200)}
+- needHashtags: ${state.needHashtags}
+- useImage: ${state.useImage}
+- imageStyle: ${state.useImage ? state.imageStyle : "N/A"}
+- schedule: ${state.postsPerWeek} posts/week
+- duration: ${state.months} months
+- date range: ${startISO} to ${endISO}
+
+Public holidays within date range (optional hooks):
+${holidayText}
+
+Requirements:
+- Distribute dates naturally across weeks.
+- Output in selected language only.
+- Return ONLY JSON.
+`;
+}
+
+async function callDeepSeek(system: string, user: string) {
+  const apiKey = process.env.DEEPSEEK_API_KEY;
+  const baseUrl = process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com";
+  const model = process.env.DEEPSEEK_MODEL || "deepseek-chat";
+  if (!apiKey) throw new Error("Missing DEEPSEEK_API_KEY");
+
+  const resp = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model,
+      temperature: 0.7,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+    }),
+  });
+
+  const text = await resp.text();
+  if (!resp.ok) throw new Error(`DeepSeek API error: ${resp.status} ${text}`);
+  const data = JSON.parse(text);
+  const content = data?.choices?.[0]?.message?.content;
+  if (!content || typeof content !== "string") throw new Error("DeepSeek: empty content");
+  return content;
+}
+
+/** ========== File Save ========== */
+async function ensureDir(rel: "uploads" | "cutouts") {
+  const dir = path.join(process.cwd(), "public", rel);
+  await fs.mkdir(dir, { recursive: true });
+  return dir;
+}
+function extFromFile(file: File) {
+  const name = file.name || "";
+  const m = name.match(/\.([a-zA-Z0-9]+)$/);
+  if (m?.[1]) return m[1].toLowerCase();
+  const type = file.type || "";
+  if (type.includes("png")) return "png";
+  if (type.includes("jpeg") || type.includes("jpg")) return "jpg";
+  if (type.includes("webp")) return "webp";
+  return "png";
+}
+async function saveUploadedFiles(files: File[]) {
+  if (!files.length) return [];
+  const dir = await ensureDir("uploads");
+
+  const saved: { url: string; filename: string; size: number; type: string }[] = [];
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i];
+    const buf = Buffer.from(await f.arrayBuffer());
+    const ext = extFromFile(f);
+    const filename = `${Date.now()}-${Math.random().toString(16).slice(2)}-${i}.${ext}`;
+    const fullPath = path.join(dir, filename);
+    await fs.writeFile(fullPath, buf);
+    saved.push({ url: `/uploads/${filename}`, filename, size: f.size, type: f.type });
+  }
+  return saved;
+}
+
+/** ========== removebg ========== */
+async function callRemoveBg(buffer: Buffer, filename: string, mime: string) {
+  const url = process.env.REMOVE_BG_URL;
+  if (!url) throw new Error("REMOVE_BG_URL not set");
+
+  async function tryField(fieldName: string) {
+    const fd = new FormData();
+    fd.append(fieldName, new Blob([buffer], { type: mime || "application/octet-stream" }), filename);
+    const resp = await fetch(url, { method: "POST", body: fd as any });
+    if (!resp.ok) {
+      const t = await resp.text().catch(() => "");
+      throw new Error(`removebg (${fieldName}) failed: ${resp.status} ${t.slice(0, 160)}`);
+    }
+    const arr = new Uint8Array(await resp.arrayBuffer());
+    return Buffer.from(arr);
+  }
+
+  try { return await tryField("image"); } catch {}
+  try { return await tryField("file"); } catch {}
+  return await tryField("images");
+}
+
+async function removeBgAndSave(savedUploads: { url: string; filename: string }[]) {
+  const cutDir = await ensureDir("cutouts");
+  const out: { url: string; filename: string }[] = [];
+
+  for (let i = 0; i < savedUploads.length; i++) {
+    const up = savedUploads[i];
+    const uploadPath = path.join(process.cwd(), "public", "uploads", up.filename);
+    const buffer = await fs.readFile(uploadPath);
+
+    const ext = (up.filename.split(".").pop() || "png").toLowerCase();
+    const mime =
+      ext === "jpg" || ext === "jpeg" ? "image/jpeg" :
+      ext === "webp" ? "image/webp" :
+      "image/png";
+
+    const png = await callRemoveBg(buffer, up.filename, mime);
+
+    const outName = `${Date.now()}-${Math.random().toString(16).slice(2)}-${i}-cut.png`;
+    await fs.writeFile(path.join(cutDir, outName), png);
+    out.push({ url: `/cutouts/${outName}`, filename: outName });
+  }
+
+  return out;
+}
+
+/** ========== Ark (Seedream 5) ========== */
+async function arkGenerateImage(params: {
+  prompt: string;
+  image?: string | string[];
+  size?: "1K" | "2K" | "adaptive";
+  watermark?: boolean;
+  sequential?: "disabled" | "auto";
+  maxImages?: number;
+  stream?: boolean;
+}) {
+  const baseUrl = process.env.ARK_BASE_URL || "https://ark.cn-beijing.volces.com/api/v3";
+  const apiKey = process.env.ARK_API_KEY;
+  const model = process.env.ARK_IMAGE_MODEL || "doubao-seedream-5-0-260128";
+  if (!apiKey) throw new Error("Missing ARK_API_KEY");
+
+  const body: any = {
+    model,
+    prompt: params.prompt,
+    response_format: "url",
+    size: params.size ?? "2K",
+    stream: params.stream ?? false,
+    watermark: params.watermark ?? false,
+    sequential_image_generation: params.sequential ?? "disabled",
+  };
+
+  if (params.image) body.image = params.image;
+  if (params.sequential === "auto") {
+    body.sequential_image_generation_options = { max_images: params.maxImages ?? 4 };
+  }
+
+  const res = await fetch(`${baseUrl}/images/generations`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify(body),
+  });
+
+  const text = await res.text();
+  if (!res.ok) throw new Error(`Ark error ${res.status}: ${text.slice(0, 400)}`);
+
+  const json = JSON.parse(text) as any;
+  const url = json?.data?.[0]?.url;
+  if (!url) throw new Error(`Ark response missing url: ${text.slice(0, 400)}`);
+  return url as string;
+}
+
+/** ========== Mock fallback (no crash) ========== */
+function buildMockPlan(state: FormState, start: Date, end: Date, holidays: Holiday[], imageUrls: string[], warning?: string) {
+  const startISO = toISODate(start);
+  const endISO = toISODate(end);
+
+  const totalWeeks = Math.max(4, state.months * 4);
+  const totalPosts = totalWeeks * state.postsPerWeek;
+  const step = Math.max(1, Math.floor((totalWeeks * 7) / totalPosts));
+  const hashtags = state.needHashtags ? pickHashtags(state.industry) : [];
+
+  const posts: GeneratedPost[] = [];
+  let cursor = new Date(start);
+  for (let i = 0; i < totalPosts; i++) {
+    cursor = addDays(cursor, step);
+    for (const platform of state.platforms) {
+      const img = state.useImage && imageUrls.length ? imageUrls[i % imageUrls.length] : undefined;
+      posts.push({
+        id: `mock-${platform}-${i}-${cursor.getTime()}`,
+        platform,
+        scheduledDate: toISODate(cursor),
+        title: platform === "facebook" || platform === "pinterest" ? `${state.productName} · Weekly Pick` : undefined,
+        bodyText: `${state.productName}\n\n${clampStr(state.keySellingPoints, 500)}\n\nTap to learn more.`,
+        hashtags,
+        imagePrompt: buildImagePrompt(state, platform),
+        imageUrl: img,
+      });
+    }
+  }
+
+  const res: any = { taskId: `mock_${Date.now()}`, startDate: startISO, endDate: endISO, posts };
+  if (warning) res.warning = warning;
+  return res as GenerateResponse & { warning?: string };
+}
+
+export async function POST(req: Request) {
+  const start = new Date();
+
+  // 1) Parse JSON or multipart
+  let state: FormState;
+  let uploadedFiles: File[] = [];
+  const contentType = req.headers.get("content-type") || "";
+
+  if (contentType.includes("multipart/form-data")) {
+    const form = await req.formData();
+    const payload = form.get("payload");
+    state = JSON.parse(String(payload || "{}")) as FormState;
+    uploadedFiles = (form.getAll("images") as unknown as File[]) || [];
+  } else {
+    state = (await req.json()) as FormState;
+  }
+
+  const end = addMonths(start, state.months);
+  const startISO = toISODate(start);
+  const endISO = toISODate(end);
+
+  // 2) Holidays
+  const countryCode = marketToCountryCode(state.market);
+  const holidays = await getHolidaysNager(countryCode, startISO, endISO);
+
+  // 3) Save uploads
+  const savedUploads = await saveUploadedFiles(uploadedFiles.slice(0, MAX_UPLOAD_IMAGES));
+
+  // 4) removebg -> cutouts
+  let warning: string | undefined;
+  let cutoutUrls: string[] = [];
+  if (state.useImage && savedUploads.length) {
+    if (!process.env.REMOVE_BG_URL) {
+      warning = "未配置 REMOVE_BG_URL：将使用原图作为参考图。";
+      cutoutUrls = savedUploads.map(s => s.url);
+    } else {
+      try {
+        const cutouts = await removeBgAndSave(savedUploads);
+        cutoutUrls = cutouts.map(c => c.url);
+      } catch (e: any) {
+        warning = `removebg 失败，已使用原图继续。原因：${String(e?.message || e).slice(0, 180)}`;
+        cutoutUrls = savedUploads.map(s => s.url);
+      }
+    }
+  }
+
+  // 5) DeepSeek -> posts json
+  if (!process.env.DEEPSEEK_API_KEY) {
+    return NextResponse.json(buildMockPlan(state, start, end, holidays, cutoutUrls, "未配置 DeepSeek Key，已使用 Mock 生成。"));
+  }
+
+  try {
+    const system = buildSystemPrompt();
+    const user = buildUserPrompt(state, startISO, endISO, holidays);
+    const raw = await callDeepSeek(system, user);
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error(`Model returned non-JSON content: ${raw.slice(0, 200)}`);
+    }
+    const out = OutputSchema.parse(parsed);
+
+    // 6) Ark image generation (limited)
+    const refPublicUrls = cutoutUrls.map(ensureAbsoluteUrl);
+    const suffix = styleSuffix(state.imageStyle);
+
+    const posts = await Promise.all(out.posts.map(async (p, idx) => {
+      const basePrompt = state.useImage
+        ? (p.imagePrompt || buildImagePrompt(state, p.platform as Platform) || "")
+        : undefined;
+
+      const finalPrompt = state.useImage && basePrompt
+        ? `${basePrompt}\n\nStyle hints: ${suffix}\n\nRules: keep product clear, avoid heavy text overlay.`
+        : undefined;
+
+      let imageUrl: string | undefined;
+
+      if (state.useImage && refPublicUrls.length) {
+        // 默认先用抠图占位，避免 Ark 失败导致前端无图
+        imageUrl = refPublicUrls[idx % refPublicUrls.length];
+
+        // 只有前 MAX_ARK_IMAGES 张走 Ark 真正二创
+        if (process.env.ARK_API_KEY && idx < MAX_ARK_IMAGES) {
+          try {
+            imageUrl = await arkGenerateImage({
+              prompt: finalPrompt || `Create a premium marketing image for ${state.productName}. ${suffix}`,
+              image: refPublicUrls[idx % refPublicUrls.length], // 单参考图图生图
+              size: "2K",
+              watermark: false,
+              sequential: "disabled",
+              stream: false,
+            });
+          } catch (e: any) {
+            warning = (warning ? warning + "；" : "") + `Ark 生成失败，已回退为抠图占位。原因：${String(e?.message || e).slice(0, 160)}`;
+          }
+        } else if (!process.env.ARK_API_KEY) {
+          warning = (warning ? warning + "；" : "") + "未配置 ARK_API_KEY：图片将仅使用抠图占位。";
+        }
+      } else if (state.useImage) {
+        warning = (warning ? warning + "；" : "") + "你勾选了“同时生成图片”，但没有上传图片：目前仅生成 imagePrompt。";
+      }
+
+      return {
+        id: `${p.platform}-${p.scheduledDate}-${idx}`,
+        platform: p.platform as Platform,
+        scheduledDate: p.scheduledDate,
+        title: p.title,
+        bodyText: p.bodyText,
+        hashtags: p.hashtags,
+        imagePrompt: state.useImage ? finalPrompt : undefined,
+        imageUrl,
+      } as GeneratedPost;
+    }));
+
+    const res: GenerateResponse = {
+      taskId: `ds_${Date.now()}`,
+      startDate: startISO,
+      endDate: endISO,
+      posts,
+    };
+
+    return NextResponse.json(warning ? ({ ...res, warning } as any) : res);
+  } catch (e: any) {
+    const msg = String(e?.message || "DeepSeek failed");
+    const w =
+      msg.includes("402") || msg.toLowerCase().includes("insufficient balance")
+        ? "DeepSeek 余额不足（402），已自动使用 Mock 生成。"
+        : `DeepSeek 调用失败，已自动使用 Mock 生成。原因：${msg.slice(0, 160)}`;
+
+    return NextResponse.json(buildMockPlan(state, start, end, holidays, cutoutUrls, warning ? `${w}；${warning}` : w));
+  }
+}

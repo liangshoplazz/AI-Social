@@ -1,0 +1,349 @@
+import { NextResponse } from "next/server";
+import { z } from "zod";
+import type { FormState, GenerateResponse, GeneratedPost, Platform } from "@/lib/spg-types";
+import path from "path";
+import { promises as fs } from "fs";
+
+export const runtime = "nodejs";
+
+const PlatformEnum = z.enum(["instagram", "facebook", "x", "pinterest"]);
+const PostSchema = z.object({
+  platform: PlatformEnum,
+  scheduledDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  title: z.string().optional(),
+  bodyText: z.string().min(1),
+  hashtags: z.array(z.string()).default([]),
+  imagePrompt: z.string().optional(),
+});
+const OutputSchema = z.object({ posts: z.array(PostSchema).min(1) });
+
+function toISODate(d: Date) {
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+function addMonths(from: Date, months: number) {
+  const d = new Date(from);
+  d.setMonth(d.getMonth() + months);
+  return d;
+}
+function addDays(d: Date, days: number) {
+  const x = new Date(d);
+  x.setDate(x.getDate() + days);
+  return x;
+}
+function clampStr(s: string, max = 2200) {
+  return s.length > max ? s.slice(0, max) + "…" : s;
+}
+function marketToCountryCode(market: string) {
+  const m = (market || "").toUpperCase();
+  const map: Record<string, string> = { US: "US", UK: "GB", FR: "FR", DE: "DE", ES: "ES", JP: "JP" };
+  return map[m] || "US";
+}
+
+type Holiday = { date: string; localName?: string; name?: string };
+const holidayCache = new Map<string, { ts: number; data: Holiday[] }>();
+
+async function getHolidaysNager(countryCode: string, startISO: string, endISO: string) {
+  const cacheKey = `${countryCode}:${startISO}:${endISO}`;
+  const cached = holidayCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < 6 * 60 * 60 * 1000) return cached.data;
+
+  const startYear = Number(startISO.slice(0, 4));
+  const endYear = Number(endISO.slice(0, 4));
+  const years = startYear === endYear ? [startYear] : [startYear, endYear];
+
+  const all: Holiday[] = [];
+  for (const y of years) {
+    const url = `https://date.nager.at/api/v3/PublicHolidays/${y}/${countryCode}`;
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      holidayCache.set(cacheKey, { ts: Date.now(), data: [] });
+      return [];
+    }
+    const arr = (await resp.json()) as any[];
+    for (const h of arr || []) {
+      if (h?.date) all.push({ date: String(h.date), localName: h.localName, name: h.name });
+    }
+  }
+
+  const data = all.filter((h) => h.date >= startISO && h.date <= endISO).sort((a, b) => a.date.localeCompare(b.date));
+  holidayCache.set(cacheKey, { ts: Date.now(), data });
+  return data;
+}
+
+function pickHashtags(industry: string) {
+  const base = ["wellness", "selfcare", "dailyhabits", "shoponline"];
+  const map: Record<string, string[]> = {
+    "保健品": ["supplements", "coq10", "hearthealth", "energyboost"],
+    "护肤": ["skincare", "glowingskin", "beautyroutine", "cleanbeauty"],
+    "美容": ["beauty", "beautytips", "musthave", "routine"],
+    "时尚": ["style", "outfit", "streetstyle", "wardrobe"],
+    "电子产品": ["tech", "gadgets", "smartlife", "innovation"],
+    "家居": ["homedecor", "cozyhome", "interior", "homeideas"],
+    "宠物": ["petlove", "petcare", "catlife", "doglife"],
+    "运动健身": ["fitness", "workout", "training", "fitlife"],
+  };
+  return [...base, ...(map[industry] || [])].slice(0, 10);
+}
+
+function buildMockCopy(state: FormState, platform: Platform, holidays: Holiday[]) {
+  const p = state.productName.trim();
+  const sp = state.keySellingPoints.trim();
+  const maybeHoliday = holidays[0]?.name ? `This week: ${holidays[0].name}. ` : "";
+  if (platform === "x") return `${maybeHoliday}${p}: ${sp.replace(/\n/g, " ").slice(0, 200)} Learn more.`;
+  if (platform === "pinterest") return `Save this ✨\n${p}\n${sp}\nDiscover more.`;
+  if (platform === "facebook") return `${p}\n\n${maybeHoliday}${sp}\n\nLearn more today.`;
+  return `${p}\n\n${maybeHoliday}${sp}\n\nTap to learn more.`;
+}
+
+function buildImagePrompt(state: FormState, platform: Platform) {
+  if (!state.useImage) return undefined;
+
+  const ratio =
+    platform === "instagram" ? "1:1" :
+    platform === "pinterest" ? "2:3" :
+    platform === "facebook" ? "4:5" :
+    "16:9";
+
+  return `Create a marketing image for "${state.productName}".
+Style: ${state.imageStyle}. Tone: ${state.tone}. Audience: ${state.audience}. Industry: ${state.industry}.
+Composition: premium DTC ad, clean layout, strong focal product, readable negative space, no excessive text, high quality lighting.
+Aspect ratio: ${ratio}.`;
+}
+
+function buildSystemPrompt() {
+  return `
+You are a senior social media copywriter for cross-border DTC brands (Shopify sellers).
+Return ONLY valid JSON. No markdown. No extra text.
+Schema: { "posts": [ { "platform": "...", "scheduledDate": "YYYY-MM-DD", "title"?, "bodyText": "...", "hashtags": ["..."], "imagePrompt"? } ] }
+Rules:
+- scheduledDate must be within date range.
+- Platform styles:
+  - instagram: longer caption ok, line breaks, friendly CTA, emojis allowed.
+  - facebook: informative, trust-building, clear CTA.
+  - x: concise, punchy, ideally <= 240 chars.
+  - pinterest: benefit-led, save-worthy, include helpful title sometimes.
+- If needHashtags=false => [].
+- If useImage=false => omit imagePrompt.
+- If useImage=true => provide imagePrompt per post (short but specific).
+Holiday usage: natural, not forced.
+Safety: avoid medical claims/guarantees for supplements/skincare. Use compliant language like "supports", "may", "daily routine".
+`;
+}
+
+function buildUserPrompt(state: FormState, startISO: string, endISO: string, holidays: Holiday[]) {
+  const holidayText =
+    holidays.length === 0
+      ? "No holiday data available."
+      : holidays.slice(0, 25).map((h) => `- ${h.date}: ${h.name || h.localName || "Holiday"}`).join("\n");
+
+  return `
+Generate a social posting plan.
+Inputs:
+- platforms: ${JSON.stringify(state.platforms)}
+- market: ${state.market} (countryCode=${marketToCountryCode(state.market)})
+- language: ${state.language}
+- tone: ${state.tone}
+- audience: ${state.audience}
+- industry: ${state.industry}
+- productName: ${state.productName}
+- keySellingPoints: ${clampStr(state.keySellingPoints, 1200)}
+- needHashtags: ${state.needHashtags}
+- useImage: ${state.useImage}
+- imageStyle: ${state.useImage ? state.imageStyle : "N/A"}
+- schedule: ${state.postsPerWeek} posts/week
+- duration: ${state.months} months
+- date range: ${startISO} to ${endISO}
+
+Public holidays within date range (optional hooks):
+${holidayText}
+
+Requirements:
+- Distribute dates naturally across weeks.
+- Output in selected language only.
+- Return ONLY JSON.
+`;
+}
+
+async function callDeepSeek(system: string, user: string) {
+  const apiKey = process.env.DEEPSEEK_API_KEY;
+  const baseUrl = process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com";
+  const model = process.env.DEEPSEEK_MODEL || "deepseek-chat";
+  if (!apiKey) throw new Error("Missing DEEPSEEK_API_KEY");
+
+  const resp = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model,
+      temperature: 0.7,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+    }),
+  });
+
+  const text = await resp.text();
+  if (!resp.ok) throw new Error(`DeepSeek API error: ${resp.status} ${text}`);
+  const data = JSON.parse(text);
+  const content = data?.choices?.[0]?.message?.content;
+  if (!content || typeof content !== "string") throw new Error("DeepSeek: empty content");
+  return content;
+}
+
+async function ensureUploadsDir() {
+  const dir = path.join(process.cwd(), "public", "uploads");
+  await fs.mkdir(dir, { recursive: true });
+  return dir;
+}
+
+function extFromFile(file: File) {
+  const name = file.name || "";
+  const m = name.match(/\.([a-zA-Z0-9]+)$/);
+  if (m?.[1]) return m[1].toLowerCase();
+  const type = file.type || "";
+  if (type.includes("png")) return "png";
+  if (type.includes("jpeg") || type.includes("jpg")) return "jpg";
+  if (type.includes("webp")) return "webp";
+  return "png";
+}
+
+async function saveUploadedFiles(files: File[]) {
+  if (!files.length) return [];
+  const dir = await ensureUploadsDir();
+
+  const saved: { url: string; filename: string; size: number; type: string }[] = [];
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i];
+    const buf = Buffer.from(await f.arrayBuffer());
+    const ext = extFromFile(f);
+    const filename = `${Date.now()}-${Math.random().toString(16).slice(2)}-${i}.${ext}`;
+    const fullPath = path.join(dir, filename);
+    await fs.writeFile(fullPath, buf);
+    saved.push({ url: `/uploads/${filename}`, filename, size: f.size, type: f.type });
+  }
+  return saved;
+}
+
+function buildMockPlan(state: FormState, start: Date, end: Date, holidays: Holiday[], imageUrls: string[], warning?: string) {
+  const startISO = toISODate(start);
+  const endISO = toISODate(end);
+
+  const totalWeeks = Math.max(4, state.months * 4);
+  const totalPosts = totalWeeks * state.postsPerWeek;
+  const step = Math.max(1, Math.floor((totalWeeks * 7) / totalPosts));
+  const hashtags = state.needHashtags ? pickHashtags(state.industry) : [];
+
+  const posts: GeneratedPost[] = [];
+  let cursor = new Date(start);
+  for (let i = 0; i < totalPosts; i++) {
+    cursor = addDays(cursor, step);
+    for (const platform of state.platforms) {
+      const img = state.useImage && imageUrls.length ? imageUrls[(i) % imageUrls.length] : undefined;
+      posts.push({
+        id: `mock-${platform}-${i}-${cursor.getTime()}`,
+        platform,
+        scheduledDate: toISODate(cursor),
+        title: platform === "facebook" || platform === "pinterest" ? `${state.productName} · Weekly Pick` : undefined,
+        bodyText: buildMockCopy(state, platform, holidays),
+        hashtags,
+        imagePrompt: buildImagePrompt(state, platform),
+        imageUrl: img,
+      });
+    }
+  }
+
+  const res: any = { taskId: `mock_${Date.now()}`, startDate: startISO, endDate: endISO, posts };
+  if (warning) res.warning = warning;
+  return res as GenerateResponse & { warning?: string };
+}
+
+export async function POST(req: Request) {
+  const start = new Date();
+
+  // 1) Parse JSON or multipart
+  let state: FormState;
+  let uploadedFiles: File[] = [];
+  const contentType = req.headers.get("content-type") || "";
+
+  if (contentType.includes("multipart/form-data")) {
+    const form = await req.formData();
+    const payload = form.get("payload");
+    state = JSON.parse(String(payload || "{}")) as FormState;
+    uploadedFiles = (form.getAll("images") as unknown as File[]) || [];
+  } else {
+    state = (await req.json()) as FormState;
+  }
+
+  // 2) Date range + holidays
+  const end = addMonths(start, state.months);
+  const startISO = toISODate(start);
+  const endISO = toISODate(end);
+  const countryCode = marketToCountryCode(state.market);
+  const holidays = await getHolidaysNager(countryCode, startISO, endISO);
+
+  // 3) Save uploads (MVP: just save, no removebg/jimeng yet)
+  const saved = await saveUploadedFiles(uploadedFiles.slice(0, 3));
+  const imageUrls = saved.map((s) => s.url);
+
+  // 4) If DeepSeek missing or fails -> mock fallback (still returns imageUrl if uploaded)
+  if (!process.env.DEEPSEEK_API_KEY) {
+    return NextResponse.json(
+      buildMockPlan(state, start, end, holidays, imageUrls, "未配置 DeepSeek Key，已使用 Mock 生成。")
+    );
+  }
+
+  try {
+    const system = buildSystemPrompt();
+    const user = buildUserPrompt(state, startISO, endISO, holidays);
+    const raw = await callDeepSeek(system, user);
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error(`Model returned non-JSON content: ${raw.slice(0, 200)}`);
+    }
+
+    const out = OutputSchema.parse(parsed);
+
+    const res: GenerateResponse = {
+      taskId: `ds_${Date.now()}`,
+      startDate: startISO,
+      endDate: endISO,
+      posts: out.posts.map((p, idx) => {
+        const img = state.useImage && imageUrls.length ? imageUrls[idx % imageUrls.length] : undefined;
+        return {
+          id: `${p.platform}-${p.scheduledDate}-${idx}`,
+          platform: p.platform as Platform,
+          scheduledDate: p.scheduledDate,
+          title: p.title,
+          bodyText: p.bodyText,
+          hashtags: p.hashtags,
+          imagePrompt: state.useImage ? (p.imagePrompt || buildImagePrompt(state, p.platform as Platform)) : undefined,
+          imageUrl: img,
+        };
+      }),
+    };
+
+    // 如果用户勾选图片但没上传，提醒一下（先不阻塞）
+    const warning =
+      state.useImage && imageUrls.length === 0
+        ? "你勾选了“同时生成图片”，但没有上传图片：目前仅生成 imagePrompt。上传 1-3 张图后将直接回填 imageUrl。"
+        : undefined;
+
+    return NextResponse.json(warning ? ({ ...res, warning } as any) : res);
+  } catch (e: any) {
+    const msg = String(e?.message || "DeepSeek failed");
+    const warning =
+      msg.includes("402") || msg.toLowerCase().includes("insufficient balance")
+        ? "DeepSeek 余额不足（402），已自动使用 Mock 生成。"
+        : `DeepSeek 调用失败，已自动使用 Mock 生成。原因：${msg.slice(0, 160)}`;
+
+    return NextResponse.json(buildMockPlan(state, start, end, holidays, imageUrls, warning));
+  }
+}
