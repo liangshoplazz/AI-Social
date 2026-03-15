@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import type { FormState, GenerateResponse, Platform } from "@/lib/spg-types";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -8,7 +8,6 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Separator } from "@/components/ui/separator";
 
 const PLATFORMS: { key: Platform; label: string }[] = [
   { key: "instagram", label: "Instagram" },
@@ -19,27 +18,38 @@ const PLATFORMS: { key: Platform; label: string }[] = [
 
 export function FormPanel({ onGenerated }: { onGenerated: (res: GenerateResponse) => void }) {
   const [loading, setLoading] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [progressText, setProgressText] = useState<string>("");
+  const progressTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+
   const [files, setFiles] = useState<File[]>([]);
 
   const [state, setState] = useState<FormState>({
     platforms: ["instagram"],
+    market: "US",
     language: "English",
     tone: "友好有说服力",
     audience: "大众消费者",
     industry: "保健品",
-    productName: "Zoone CoQ10",
-    keySellingPoints: "核心卖点：高吸收、日常心脏能量支持、适合忙碌人群。",
+
+    brandName: "",
+
+    productName: "",
+    keySellingPoints: "",
+
+    // legacy
     needHashtags: true,
+
     mode: "text_only",
     useImage: false,
     imageStyle: "高端质感",
-    postsPerWeek: 3,
-    months: 2,
-    market: "US",
+    postsPerWeek: 1,
+    months: 1,
   });
 
   const canGenerate = useMemo(() => {
     if (!state.platforms.length) return false;
+    if (!state.brandName?.trim()) return false;
     if (!state.productName.trim()) return false;
     if (!state.keySellingPoints.trim()) return false;
     return true;
@@ -57,10 +67,32 @@ export function FormPanel({ onGenerated }: { onGenerated: (res: GenerateResponse
     if (!canGenerate) return;
     setLoading(true);
 
+    setProgress(5);
+    setProgressText("正在提交任务…");
+
+    if (progressTimer.current) {
+      clearInterval(progressTimer.current);
+      progressTimer.current = null;
+    }
+
+    const estimatedMs =
+      (state.useImage ? 25000 : 12000) + (state.platforms?.length || 1) * 1500 + (state.postsPerWeek || 1) * 800;
+    const startedAt = Date.now();
+
+    progressTimer.current = setInterval(() => {
+      const elapsed = Date.now() - startedAt;
+      const ratio = Math.min(1, elapsed / Math.max(8000, estimatedMs));
+      const next = Math.min(92, 5 + Math.floor(ratio * 87));
+      setProgress((p) => (p < next ? next : p));
+
+      if (next < 30) setProgressText("正在生成大纲…");
+      else if (next < 70) setProgressText("正在生成各平台文案…");
+      else setProgressText(state.useImage ? "正在生成图片…" : "正在整理结果…");
+    }, 350);
+
     try {
       let res: Response;
 
-      // useImage + files => multipart/form-data
       if (state.useImage && files.length) {
         const fd = new FormData();
         fd.append("payload", JSON.stringify(state));
@@ -78,37 +110,35 @@ export function FormPanel({ onGenerated }: { onGenerated: (res: GenerateResponse
 
       if (!res.ok) {
         const msg = data?.error || "生成失败（接口返回非 200）";
-        // 用 alert 兜底（即便 toast 组件没装也能看见）
         if (typeof window !== "undefined") alert(msg);
         throw new Error(msg);
       }
 
-      // 显示 warning（比如 DeepSeek 余额不足 -> 自动 Mock）
-      if (data?.warning) {
-        try {
-          const { toast } = await import("@/components/ui/use-toast");
-          toast.toast({
-            title: "提示",
-            description: String(data.warning),
-          });
-        } catch {
-          if (typeof window !== "undefined") alert(String(data.warning));
-        }
-      }
-
+      setProgress(100);
+      setProgressText("生成完成");
       onGenerated(data as GenerateResponse);
     } finally {
+      if (progressTimer.current) {
+        clearInterval(progressTimer.current);
+        progressTimer.current = null;
+      }
       setLoading(false);
+      setTimeout(() => {
+        setProgress(0);
+        setProgressText("");
+      }, 800);
     }
   }
+  const missingFields: string[] = [];
+  if (!String(state.brandName ?? "").trim()) missingFields.push("品牌名");
+  if (!String(state.productName ?? "").trim()) missingFields.push("产品名");
+  if (!String(state.keySellingPoints ?? "").trim()) missingFields.push("核心卖点");
 
   return (
     <div className="space-y-4">
-      <Card className="p-4 space-y-4">
+      <Card className="p-4 space-y-2">
         <div className="text-base font-semibold">社媒帖子生成器</div>
-        <div className="text-xs text-muted-foreground">
-          选择平台/语言/风格/受众/行业，输入产品信息，即可生成海外风格的发帖计划（按月份横向展示）。
-        </div>
+        <div className="text-xs text-muted-foreground">只需填品牌名 + 产品信息，即可生成并高仿预览</div>
       </Card>
 
       <Card className="p-4 space-y-4">
@@ -233,12 +263,22 @@ export function FormPanel({ onGenerated }: { onGenerated: (res: GenerateResponse
 
       <Card className="p-4 space-y-4">
         <div className="font-semibold">4) 产品信息</div>
+
+        <div className="space-y-2">
+          <div className="text-sm">品牌名（用于各平台用户名展示）</div>
+          <Input
+            value={state.brandName ?? ""}
+            onChange={(e) => setState((s) => ({ ...s, brandName: e.target.value }))}
+            placeholder="例如：Zoone"
+          />
+        </div>
+
         <div className="space-y-2">
           <div className="text-sm">产品名</div>
           <Input
             value={state.productName}
             onChange={(e) => setState((s) => ({ ...s, productName: e.target.value }))}
-            placeholder="例如：Zoone CoQ10"
+            placeholder="例如：Bluetooth Earplugs"
           />
         </div>
 
@@ -248,24 +288,7 @@ export function FormPanel({ onGenerated }: { onGenerated: (res: GenerateResponse
             value={state.keySellingPoints}
             onChange={(e) => setState((s) => ({ ...s, keySellingPoints: e.target.value }))}
             rows={5}
-            placeholder={'例如：\n- 高吸收\n- 日常能量支持\n- 适合忙碌人群'}
-          />
-        </div>
-
-        <Separator />
-
-        <div className="flex items-center justify-between">
-          <div className="space-y-1">
-            <div className="text-sm font-medium">Hashtag</div>
-            <div className="text-xs text-muted-foreground">是否让 AI 自动生成推荐标签</div>
-          </div>
-
-          {/* 原生 checkbox，保证可点击 */}
-          <input
-            type="checkbox"
-            className="h-5 w-5"
-            checked={state.needHashtags}
-            onChange={(e) => setState((s) => ({ ...s, needHashtags: e.target.checked }))}
+            placeholder={"例如：\n- 高吸收\n- 日常能量支持\n- 适合忙碌人群"}
           />
         </div>
       </Card>
@@ -276,77 +299,69 @@ export function FormPanel({ onGenerated }: { onGenerated: (res: GenerateResponse
         <div className="flex items-center justify-between">
           <div className="space-y-1">
             <div className="text-sm font-medium">同时生成图片</div>
-            <div className="text-xs text-muted-foreground">
-              勾选后会出现图片风格与上传入口（后端将接 removebg + 即梦）。
-            </div>
+            <div className="text-xs text-muted-foreground">勾选后会出现图片风格与上传入口。</div>
           </div>
 
-          {/* 原生 checkbox，保证可点击 */}
           <input
             type="checkbox"
             className="h-5 w-5"
             checked={state.useImage}
             onChange={(e) => {
               const v = e.target.checked;
-              setState((s) => ({
-                ...s,
-                useImage: v,
-                mode: v ? "text_and_image" : "text_only",
-              }));
+              setState((s) => ({ ...s, useImage: v, mode: v ? "text_and_image" : "text_only" }));
               if (!v) setFiles([]);
             }}
           />
         </div>
 
-        {state.useImage ? (
-          <div className="space-y-3">
-            <div className="space-y-2">
-              <div className="text-sm">图片风格</div>
-              <Select value={state.imageStyle} onValueChange={(v: any) => setState((s) => ({ ...s, imageStyle: v }))}>
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="自然真实(生活方式)">自然真实(生活方式)</SelectItem>
-                  <SelectItem value="高端质感">高端质感</SelectItem>
-                  <SelectItem value="暗调奢华">暗调奢华</SelectItem>
-                  <SelectItem value="明亮电商(干净棚拍)">明亮电商(干净棚拍)</SelectItem>
-                  <SelectItem value="科技感(冷色未来)">科技感(冷色未来)</SelectItem>
-                  <SelectItem value="清新自然(植物光感)">清新自然(植物光感)</SelectItem>
-                  <SelectItem value="运动能量(动感硬朗)">运动能量(动感硬朗)</SelectItem>
-                  <SelectItem value="可爱卡通(软萌插画)">可爱卡通(软萌插画)</SelectItem>
-                  <SelectItem value="极简留白(高级排版)">极简留白(高级排版)</SelectItem>
-                </SelectContent>
-              </Select>
+	{state.useImage ? (
+  <div className="space-y-3">
 
-              <div className="text-xs text-muted-foreground">
-                MVP 阶段：先上传 1-3 张产品图并提交给后端。后端将扣图（removebg）+ 二创（即梦），并返回 imageUrl。
-              </div>
-            </div>
+    <div className="space-y-2">
+      <div className="text-sm">图片风格</div>
 
-            <div className="space-y-2">
-              <div className="text-sm">上传产品图（1-3 张）</div>
-              <Input
-                type="file"
-                accept="image/*"
-                multiple
-                onChange={(e) => {
-                  const list = Array.from(e.target.files || []).slice(0, 3);
-                  setFiles(list);
-                }}
-              />
-              <div className="text-xs text-muted-foreground">建议：主图清晰、背景干净或场景图都可以。最多 3 张。</div>
+      <Select
+        value={state.imageStyle}
+        onValueChange={(v) =>
+          setState((s) => ({ ...s, imageStyle: v }))
+        }
+      >
+        <SelectTrigger>
+          <SelectValue />
+        </SelectTrigger>
 
-              {files.length ? (
-                <div className="text-xs text-muted-foreground">
-                  已选择：{files.map((f) => f.name).join(", ")}
-                </div>
-              ) : (
-                <div className="text-xs text-muted-foreground">未选择图片（只会生成图片 prompt，不会上传图片）。</div>
-              )}
-            </div>
-          </div>
-        ) : null}
+        <SelectContent>
+          <SelectItem value="明亮电商(干净棚拍)">电商商品图</SelectItem>
+          <SelectItem value="自然真实(生活方式)">生活方式</SelectItem>
+          <SelectItem value="高端质感">高端品牌</SelectItem>
+          <SelectItem value="极简留白(高级排版)">极简高级</SelectItem>
+          <SelectItem value="(暗调奢华)">暗调奢华</SelectItem>
+          <SelectItem value="科技感(冷色未来)">科技产品</SelectItem>
+          <SelectItem value="运动能量(动感硬朗)">运动风</SelectItem>
+        </SelectContent>
+      </Select>
+    </div>
+
+    <div className="space-y-2">
+      <div className="text-sm">上传产品图（1-3 张）</div>
+
+      <Input
+        type="file"
+        accept="image/*"
+        multiple
+        onChange={(e) =>
+          setFiles(Array.from(e.target.files || []).slice(0, 3))
+        }
+      />
+
+      <div className="text-xs text-muted-foreground">
+        最多 3 张。
+      </div>
+    </div>
+
+  </div>
+) : null}
+
       </Card>
 
       <Card className="p-4 space-y-4">
@@ -355,10 +370,7 @@ export function FormPanel({ onGenerated }: { onGenerated: (res: GenerateResponse
         <div className="grid grid-cols-2 gap-3">
           <div className="space-y-2">
             <div className="text-sm">每周发帖数量（1-7）</div>
-            <Select
-              value={String(state.postsPerWeek)}
-              onValueChange={(v) => setState((s) => ({ ...s, postsPerWeek: Number(v) }))}
-            >
+            <Select value={String(state.postsPerWeek)} onValueChange={(v) => setState((s) => ({ ...s, postsPerWeek: Number(v) }))}>
               <SelectTrigger>
                 <SelectValue />
               </SelectTrigger>
@@ -386,8 +398,6 @@ export function FormPanel({ onGenerated }: { onGenerated: (res: GenerateResponse
             </Select>
           </div>
         </div>
-
-        <div className="text-xs text-muted-foreground">以生成当天起计算（后端会生成计划日期并按月份分组展示）。</div>
       </Card>
 
       <Card className="p-4">
@@ -400,10 +410,39 @@ export function FormPanel({ onGenerated }: { onGenerated: (res: GenerateResponse
             <Badge variant="secondary">{state.industry}</Badge>
           </div>
 
-          <Button disabled={!canGenerate || loading} onClick={handleGenerate}>
-            {loading ? "生成中..." : "生成帖子"}
-          </Button>
+          <div className="relative group">
+            <Button disabled={!canGenerate || loading} onClick={handleGenerate}>
+              {loading ? "生成中..." : "生成帖子"}
+            </Button>
+
+            {!canGenerate && !loading ? (
+              <div
+                className="pointer-events-none absolute right-0 top-full z-50 mt-2 w-[260px] opacity-0 translate-y-1
+                           rounded-xl border bg-background shadow-lg px-3 py-2 text-xs leading-4
+                           text-foreground transition
+                           group-hover:opacity-100 group-hover:translate-y-0 group-focus-within:opacity-100 group-focus-within:translate-y-0"
+              >
+                <div className="font-medium">需要补充信息</div>
+                <div className="mt-1 text-muted-foreground">
+                  请填写：<span className="text-foreground">{missingFields.join("、")}</span>
+                </div>
+                <div className="absolute -top-1 right-4 h-2 w-2 rotate-45 border-l border-t bg-background" />
+              </div>
+            ) : null}
+          </div>
         </div>
+
+        {loading ? (
+          <div className="mt-3 space-y-1">
+            <div className="flex items-center justify-between text-xs text-muted-foreground">
+              <span>{progressText || "生成中…"}</span>
+              <span>{progress}%</span>
+            </div>
+            <div className="h-2 w-full rounded-full bg-muted overflow-hidden">
+              <div className="h-full bg-foreground" style={{ width: `${progress}%` }} />
+            </div>
+          </div>
+        ) : null}
       </Card>
     </div>
   );
