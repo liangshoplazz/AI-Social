@@ -123,7 +123,10 @@ src/
 	•	src/app/api/generate/route.ts
 	•	src/app/api/generate-image/route.ts
 
-# 环境变量
+
+---
+
+## 项目简介
 
 请在项目根目录创建 .env 文件，并配置以下变量：
 NEXT_PUBLIC_SUPABASE_URL=
