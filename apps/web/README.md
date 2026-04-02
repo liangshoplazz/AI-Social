@@ -62,7 +62,7 @@ Shoplazza AI Social 主要解决以下问题：
 
 ### 4. 图片生成
 - 支持上传 1–3 张参考产品图
-- 支持 removebg 处理（可选）
+- 支持 removebg 处理
 - 支持根据参考图生成产品营销图
 - 支持同一天多个平台共用同一张图片
 - 图片生成结果支持保存并回写历史记录
@@ -122,3 +122,21 @@ src/
 **核心接口：**
 	•	src/app/api/generate/route.ts
 	•	src/app/api/generate-image/route.ts
+
+# 环境变量
+
+请在项目根目录创建 .env 文件，并配置以下变量：
+NEXT_PUBLIC_SUPABASE_URL=
+NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=
+
+DEEPSEEK_API_KEY=
+DEEPSEEK_BASE_URL=
+DEEPSEEK_MODEL=
+
+ARK_API_KEY=
+ARK_BASE_URL=
+ARK_IMAGE_MODEL=
+
+REMOVE_BG_URL=
+
+
